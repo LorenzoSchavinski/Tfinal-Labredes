@@ -63,7 +63,6 @@ def run_sender(host, port, filepath, mode="saw", window=1):
     sock.settimeout(TIMEOUT)
 
     total_retransmissions = 0
-    start = time.monotonic()
 
     # ---- Handshake (3 vias) ----
     syn = Packet(syn=True, length=window)
@@ -73,6 +72,8 @@ def run_sender(host, port, filepath, mode="saw", window=1):
     effective_window = min(window, reply.length if reply.length else 1)
     sock.sendto(Packet(ack_flag=True).to_bytes(), dest)
     print(f"[sender] handshake ok, janela efetiva = {effective_window}")
+
+    start = time.monotonic()  # mede só a transferência, não o handshake
 
     # ---- Transferência (stop-and-wait) ----
     chunks = _chunk_file(data)

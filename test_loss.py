@@ -37,7 +37,7 @@ class LossyProxy(threading.Thread):
         self.receiver_addr = ("127.0.0.1", receiver_port)   # Y
         self.drop_data_every = drop_data_every
         self.drop_ack_every = drop_ack_every
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", listen_port))
         self.sock.settimeout(0.2)
@@ -45,7 +45,7 @@ class LossyProxy(threading.Thread):
     def run(self):
         data_count = 0
         ack_count = 0
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 pkt, src = self.sock.recvfrom(2048)
             except socket.timeout:
@@ -64,7 +64,7 @@ class LossyProxy(threading.Thread):
                 self.sock.sendto(pkt, self.receiver_addr)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=1)
         self.sock.close()
 

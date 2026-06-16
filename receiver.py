@@ -20,10 +20,16 @@ def run_receiver(port, outpath="received.bin", mode="saw", window=1):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("", port))
 
-    # ---- Handshake: espera o SYN (bloqueante) ----
+    # ---- Handshake: espera o SYN ----
+    sock.settimeout(IDLE_TIMEOUT)
     sender_addr = None
     while sender_addr is None:
-        data, addr = sock.recvfrom(2048)
+        try:
+            data, addr = sock.recvfrom(2048)
+        except socket.timeout:
+            print("[receiver] timeout aguardando SYN — encerrando")
+            sock.close()
+            return
         syn = Packet.from_bytes(data)
         if syn.crc_ok and syn.syn:
             sender_addr = addr
@@ -34,7 +40,6 @@ def run_receiver(port, outpath="received.bin", mode="saw", window=1):
     print(f"[receiver] handshake ok, janela efetiva = {effective_window}")
 
     # ---- Recepção dos dados ----
-    sock.settimeout(IDLE_TIMEOUT)
     buffer = []
     expected_seq = 0
     stream_done = False
