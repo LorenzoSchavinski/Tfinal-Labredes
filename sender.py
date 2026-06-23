@@ -236,7 +236,6 @@ def run_sender(host, port, filepath, mode="saw", window=1, verbose=True):
     sock.settimeout(TIMEOUT)
 
     stats = {"rt": 0}
-    start = time.monotonic()
 
     effective_window = _handshake(sock, dest, window, verbose)
     chunks = _chunk_file(data)

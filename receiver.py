@@ -19,7 +19,12 @@ def _handshake(sock, window, verbose=True):
     """Espera o SYN, responde SYN+ACK. Retorna (sender_addr, synack_bytes, janela)."""
     sender_addr = None
     while sender_addr is None:
-        data, addr = sock.recvfrom(2048)
+        try:
+            data, addr = sock.recvfrom(2048)
+        except socket.timeout:
+            print("[receiver] timeout aguardando SYN — encerrando")
+            sock.close()
+            return
         syn = Packet.from_bytes(data)
         if syn.crc_ok and syn.syn:
             sender_addr = addr
