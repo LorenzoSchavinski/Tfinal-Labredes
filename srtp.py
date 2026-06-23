@@ -2,7 +2,7 @@
 SRTP — protocolo de transporte confiável sobre UDP.
 
 Ponto de entrada da linha de comando. Lê os argumentos e chama o sender ou o
-receiver. (Parte 1: apenas o modo stop-and-wait, 'saw'.)
+receiver. Modos: stop-and-wait ('saw'), Go-Back-N ('gbn'), Selective Repeat ('sr').
 
 Exemplos:
     # Receiver escutando na porta 6000
@@ -18,7 +18,7 @@ from sender import run_sender
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SRTP sobre UDP (Parte 1: stop-and-wait)")
+    parser = argparse.ArgumentParser(description="SRTP sobre UDP (saw | gbn | sr)")
     parser.add_argument("--listen", action="store_true",
                         help="modo receiver (escuta na porta P)")
     parser.add_argument("--host", help="IP do receiver (modo sender)")
@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--out", default="received.bin",
                         help="arquivo de saída (modo receiver)")
     parser.add_argument("--mode", default="saw", choices=["saw", "gbn", "sr"],
-                        help="modo do protocolo (Parte 1: apenas 'saw')")
+                        help="modo do protocolo: saw | gbn | sr")
     parser.add_argument("--window", type=int, default=1,
                         help="tamanho de janela proposto no handshake")
     args = parser.parse_args()

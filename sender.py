@@ -1,13 +1,19 @@
 """
-Sender stop-and-wait do RTP.
+Sender do RTP — stop-and-wait (saw), Go-Back-N (gbn) e Selective Repeat (sr).
 
-Fluxo: handshake (3 vias) -> envia o arquivo um pacote por vez -> FIN (2 vias).
-Envia tudo para (host, P) e escuta ACKs no socket local da porta P+1.
+Fluxo comum: handshake (3 vias) -> transferência (depende do modo) -> FIN (2 vias).
+Envia tudo para (host, P) e escuta ACKs/NACKs no socket local da porta P+1.
+
+Formato de fio (contrato com o outro grupo):
+  - ACK positivo: ack_flag=True, nack=False, campo ack = seq.
+      * saw/gbn: ack cumulativo = maior seq recebido em ordem.
+      * sr: ack individual = seq exato aceito.
+  - NACK: nack=True, ack_flag=False, campo ack = seq esperado (gbn) / faltante (sr).
 """
 import socket
 import time
 
-from packet import Packet, MAX_PAYLOAD, SEQ_SPACE
+from packet import Packet, MAX_PAYLOAD, SEQ_SPACE, SEQ_MASK
 
 TIMEOUT = 0.1  # 100 ms (fixo, conforme a spec)
 
@@ -25,34 +31,201 @@ def _chunk_file(data):
     return chunks
 
 
-def _send_until(sock, dest, pkt, accept, max_retries=None):
-    """Envia pkt e retransmite a cada TIMEOUT até accept(reply) ser True.
+def _data_packet(chunks, i):
+    """Monta o pacote de dados do índice absoluto i (seq = i % 16384)."""
+    chunk = chunks[i]
+    return Packet(seq=i % SEQ_SPACE, length=len(chunk), payload=chunk)
 
-    Retorna (reply, retransmissoes). Se max_retries for atingido, retorna
-    (None, retransmissoes).
+
+def _resolve_abs(wire_seq, base, nxt):
+    """Mapeia um seq de 14 bits para o índice absoluto dentro de [base, nxt).
+
+    A janela é <= 255 << 16384, então há no máximo um índice candidato.
+    Retorna o índice absoluto ou None se não cair na janela em trânsito.
     """
-    raw = pkt.to_bytes()
-    retransmissions = 0
+    cand = base + ((wire_seq - base) & SEQ_MASK)
+    return cand if base <= cand < nxt else None
+
+
+# --------------------------------------------------------------------------
+# Handshake (compartilhado pelos três modos)
+# --------------------------------------------------------------------------
+def _handshake(sock, dest, window, verbose=True):
+    """Three-way handshake do lado iniciador. Retorna a janela efetiva."""
+    syn = Packet(syn=True, length=window)
+    raw = syn.to_bytes()
     sock.sendto(raw, dest)
     while True:
         try:
             data, _ = sock.recvfrom(2048)
         except socket.timeout:
-            if max_retries is not None and retransmissions >= max_retries:
-                return None, retransmissions
-            retransmissions += 1
             sock.sendto(raw, dest)
             continue
         reply = Packet.from_bytes(data)
-        if not reply.crc_ok:
-            continue  # pacote corrompido: ignora e segue esperando
-        if accept(reply):
-            return reply, retransmissions
+        if reply.crc_ok and reply.syn and reply.ack_flag:
+            break
+    effective = min(window, reply.length if reply.length else 1)
+    sock.sendto(Packet(ack_flag=True).to_bytes(), dest)
+    if verbose:
+        print(f"[sender] handshake ok, janela efetiva = {effective}")
+    return effective
 
 
-def run_sender(host, port, filepath, mode="saw", window=1):
-    if mode != "saw":
-        raise NotImplementedError(f"modo '{mode}' ainda não implementado (Parte 2)")
+def _close(sock, dest, stats):
+    """Encerramento (2 vias): FIN -> FIN+ACK."""
+    fin = Packet(fin=True, length=0)
+    raw = fin.to_bytes()
+    sock.sendto(raw, dest)
+    retries = 0
+    while retries < 10:
+        try:
+            data, _ = sock.recvfrom(2048)
+        except socket.timeout:
+            retries += 1
+            stats["rt"] += 1
+            sock.sendto(raw, dest)
+            continue
+        p = Packet.from_bytes(data)
+        if p.crc_ok and p.fin and p.ack_flag:
+            break
+
+
+# --------------------------------------------------------------------------
+# Stop-and-Wait
+# --------------------------------------------------------------------------
+def _send_saw(sock, dest, chunks, window, stats):
+    seq = 0
+    for chunk in chunks:
+        pkt = Packet(seq=seq, length=len(chunk), payload=chunk)
+        raw = pkt.to_bytes()
+        sock.sendto(raw, dest)
+        while True:
+            try:
+                data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                stats["rt"] += 1
+                sock.sendto(raw, dest)
+                continue
+            p = Packet.from_bytes(data)
+            if not p.crc_ok:
+                continue
+            if p.ack_flag and p.ack == seq:
+                break
+            # NACK em saw não é esperado; timeout resolve.
+        seq = (seq + 1) % SEQ_SPACE
+
+
+# --------------------------------------------------------------------------
+# Go-Back-N
+# --------------------------------------------------------------------------
+def _send_gbn(sock, dest, chunks, window, stats):
+    W = max(1, window)
+    M = len(chunks)
+    base = 0           # índice absoluto do mais antigo não confirmado
+    nxt = 0            # próximo índice absoluto a enviar
+    timer = None       # deadline (monotonic) do timer da base
+
+    def resend_window():
+        for i in range(base, nxt):
+            sock.sendto(_data_packet(chunks, i).to_bytes(), dest)
+            stats["rt"] += 1
+
+    while base < M:
+        # enche a janela
+        while nxt < base + W and nxt < M:
+            sock.sendto(_data_packet(chunks, nxt).to_bytes(), dest)
+            if base == nxt:
+                timer = time.monotonic() + TIMEOUT
+            nxt += 1
+
+        remaining = (timer - time.monotonic()) if timer else TIMEOUT
+        if remaining <= 0:
+            resend_window()
+            timer = time.monotonic() + TIMEOUT
+            continue
+
+        sock.settimeout(remaining)
+        try:
+            data, _ = sock.recvfrom(2048)
+        except socket.timeout:
+            resend_window()
+            timer = time.monotonic() + TIMEOUT
+            continue
+
+        p = Packet.from_bytes(data)
+        if not p.crc_ok:
+            continue
+        if p.nack:                         # NACK -> reenvia toda a janela
+            resend_window()
+            timer = time.monotonic() + TIMEOUT
+            continue
+        if p.ack_flag:                     # ACK cumulativo: confirma até p.ack
+            acked = _resolve_abs(p.ack, base, nxt)
+            if acked is not None:
+                base = acked + 1
+                timer = (time.monotonic() + TIMEOUT) if base < nxt else None
+
+
+# --------------------------------------------------------------------------
+# Selective Repeat
+# --------------------------------------------------------------------------
+def _send_sr(sock, dest, chunks, window, stats):
+    W = max(1, window)
+    M = len(chunks)
+    base = 0
+    nxt = 0
+    acked = set()       # índices absolutos confirmados individualmente
+    timers = {}         # índice absoluto -> deadline (monotonic)
+
+    while base < M:
+        # enche a janela
+        while nxt < base + W and nxt < M:
+            sock.sendto(_data_packet(chunks, nxt).to_bytes(), dest)
+            timers[nxt] = time.monotonic() + TIMEOUT
+            nxt += 1
+
+        now = time.monotonic()
+        due = [i for i, d in timers.items() if d <= now]
+        if due:
+            for i in due:
+                sock.sendto(_data_packet(chunks, i).to_bytes(), dest)
+                stats["rt"] += 1
+                timers[i] = now + TIMEOUT
+            continue
+
+        remaining = (min(timers.values()) - now) if timers else TIMEOUT
+        sock.settimeout(max(remaining, 0.001))
+        try:
+            data, _ = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+
+        p = Packet.from_bytes(data)
+        if not p.crc_ok:
+            continue
+        if p.nack:                         # NACK(faltante) -> reenvia só aquele
+            miss = _resolve_abs(p.ack, base, nxt)
+            if miss is not None and miss in timers:
+                sock.sendto(_data_packet(chunks, miss).to_bytes(), dest)
+                stats["rt"] += 1
+                timers[miss] = time.monotonic() + TIMEOUT
+            continue
+        if p.ack_flag:                     # ACK individual
+            a = _resolve_abs(p.ack, base, nxt)
+            if a is not None:
+                acked.add(a)
+                timers.pop(a, None)
+                while base in acked:       # desliza por toda a faixa contígua
+                    acked.discard(base)
+                    base += 1
+
+
+_DISPATCH = {"saw": _send_saw, "gbn": _send_gbn, "sr": _send_sr}
+
+
+def run_sender(host, port, filepath, mode="saw", window=1, verbose=True):
+    if mode not in _DISPATCH:
+        raise ValueError(f"modo desconhecido: {mode}")
 
     with open(filepath, "rb") as f:
         data = f.read()
@@ -62,38 +235,22 @@ def run_sender(host, port, filepath, mode="saw", window=1):
     sock.bind(("", port + 1))      # sender escuta ACKs/NACKs em P+1
     sock.settimeout(TIMEOUT)
 
-    total_retransmissions = 0
+    stats = {"rt": 0}
     start = time.monotonic()
 
-    # ---- Handshake (3 vias) ----
-    syn = Packet(syn=True, length=window)
-    reply, rt = _send_until(sock, dest, syn,
-                            lambda p: p.syn and p.ack_flag)
-    total_retransmissions += rt
-    effective_window = min(window, reply.length if reply.length else 1)
-    sock.sendto(Packet(ack_flag=True).to_bytes(), dest)
-    print(f"[sender] handshake ok, janela efetiva = {effective_window}")
-
-    # ---- Transferência (stop-and-wait) ----
+    effective_window = _handshake(sock, dest, window, verbose)
     chunks = _chunk_file(data)
-    seq = 0
-    for chunk in chunks:
-        pkt = Packet(seq=seq, length=len(chunk), payload=chunk)
-        _, rt = _send_until(sock, dest, pkt,
-                            lambda p, s=seq: p.ack_flag and p.ack == s)
-        total_retransmissions += rt
-        seq = (seq + 1) % SEQ_SPACE
-
-    # ---- Encerramento (2 vias) ----
-    fin = Packet(fin=True, length=0)
-    _, rt = _send_until(sock, dest, fin,
-                        lambda p: p.fin and p.ack_flag, max_retries=10)
-    total_retransmissions += rt
+    _DISPATCH[mode](sock, dest, chunks, effective_window, stats)
+    _close(sock, dest, stats)
 
     elapsed = time.monotonic() - start
     sock.close()
 
     throughput = (len(data) * 8 / elapsed) if elapsed > 0 else 0
-    print(f"[sender] enviados {len(data)} bytes em {len(chunks)} pacotes")
-    print(f"[sender] tempo: {elapsed:.3f}s | throughput: {throughput / 1000:.1f} kbit/s")
-    print(f"[sender] retransmissões: {total_retransmissions}")
+    if verbose:
+        print(f"[sender] modo={mode} janela={effective_window} "
+              f"enviados {len(data)} bytes em {len(chunks)} pacotes")
+        print(f"[sender] tempo: {elapsed:.3f}s | throughput: {throughput / 1000:.1f} kbit/s")
+        print(f"[sender] retransmissões: {stats['rt']}")
+    return {"bytes": len(data), "packets": len(chunks), "elapsed": elapsed,
+            "rt": stats["rt"], "window": effective_window}

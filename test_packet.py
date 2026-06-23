@@ -58,6 +58,14 @@ class TestPacket(unittest.TestCase):
         self.assertTrue(out.syn)
         self.assertEqual(out.length, 16)
 
+    def test_nack_carrega_seq_no_campo_ack(self):
+        # NACK (Parte 2): nack=True, ack_flag=False, campo ack = seq relevante.
+        p = Packet(nack=True, ack=1234)
+        out = Packet.from_bytes(p.to_bytes())
+        self.assertTrue(out.nack)
+        self.assertFalse(out.ack_flag)
+        self.assertEqual(out.ack, 1234)
+
     def test_seq_faz_wrap_com_mascara(self):
         # SEQ acima do espaço de 14 bits deve ser mascarado (defensivo).
         p = Packet(seq=16384)  # == 0 no espaço de 14 bits
