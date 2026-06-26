@@ -11,6 +11,7 @@ Formato de fio (contrato com o outro grupo):
   - NACK: nack=True, ack_flag=False, campo ack = seq esperado (gbn) / faltante (sr).
 """
 import socket
+import struct
 import time
 
 from packet import Packet, MAX_PAYLOAD, SEQ_SPACE, SEQ_MASK
@@ -61,7 +62,10 @@ def _handshake(sock, dest, window, verbose=True):
         except socket.timeout:
             sock.sendto(raw, dest)
             continue
-        reply = Packet.from_bytes(data)
+        try:
+            reply = Packet.from_bytes(data)
+        except (struct.error, ValueError):
+            continue
         if reply.crc_ok and reply.syn and reply.ack_flag:
             break
     effective = min(window, reply.length if reply.length else 1)
@@ -73,6 +77,7 @@ def _handshake(sock, dest, window, verbose=True):
 
 def _close(sock, dest, stats):
     """Encerramento (2 vias): FIN -> FIN+ACK."""
+    sock.settimeout(TIMEOUT)       # loops de dados alteram o timeout; FIN usa o fixo da spec
     fin = Packet(fin=True, length=0)
     raw = fin.to_bytes()
     sock.sendto(raw, dest)
@@ -85,7 +90,10 @@ def _close(sock, dest, stats):
             stats["rt"] += 1
             sock.sendto(raw, dest)
             continue
-        p = Packet.from_bytes(data)
+        try:
+            p = Packet.from_bytes(data)
+        except (struct.error, ValueError):
+            continue
         if p.crc_ok and p.fin and p.ack_flag:
             break
 
@@ -106,8 +114,19 @@ def _send_saw(sock, dest, chunks, window, stats):
                 stats["rt"] += 1
                 sock.sendto(raw, dest)
                 continue
-            p = Packet.from_bytes(data)
+            try:
+                p = Packet.from_bytes(data)
+            except (struct.error, ValueError):
+                continue
             if not p.crc_ok:
+                continue
+            # SYN+ACK retransmitido (handshake): reenvia o 3o ACK e segue esperando.
+            # Robustez de interop: nosso 3o ACK pode ter se perdido, e um SYN+ACK
+            # tem ack_flag=1/ack=0, que seria confundido com o ACK do pacote seq 0.
+            if p.syn and p.ack_flag:
+                sock.sendto(Packet(ack_flag=True).to_bytes(), dest)   # reenvia o 3o ACK do handshake
+                continue
+            if p.fin:                          # FIN não é ACK de dados
                 continue
             if p.ack_flag and p.ack == seq:
                 break
@@ -152,8 +171,19 @@ def _send_gbn(sock, dest, chunks, window, stats):
             timer = time.monotonic() + TIMEOUT
             continue
 
-        p = Packet.from_bytes(data)
+        try:
+            p = Packet.from_bytes(data)
+        except (struct.error, ValueError):
+            continue
         if not p.crc_ok:
+            continue
+        # SYN+ACK retransmitido (handshake): reenvia o 3o ACK e segue esperando.
+        # Robustez de interop: nosso 3o ACK pode ter se perdido, e um SYN+ACK
+        # tem ack_flag=1/ack=0, que cairia no ramo de ACK de dados abaixo.
+        if p.syn and p.ack_flag:
+            sock.sendto(Packet(ack_flag=True).to_bytes(), dest)   # reenvia o 3o ACK do handshake
+            continue
+        if p.fin:                          # FIN não é ACK de dados
             continue
         if p.nack:                         # NACK -> reenvia toda a janela
             resend_window()
@@ -200,8 +230,19 @@ def _send_sr(sock, dest, chunks, window, stats):
         except socket.timeout:
             continue
 
-        p = Packet.from_bytes(data)
+        try:
+            p = Packet.from_bytes(data)
+        except (struct.error, ValueError):
+            continue
         if not p.crc_ok:
+            continue
+        # SYN+ACK retransmitido (handshake): reenvia o 3o ACK e segue esperando.
+        # Robustez de interop: nosso 3o ACK pode ter se perdido, e um SYN+ACK
+        # tem ack_flag=1/ack=0, que cairia no ramo de ACK individual abaixo.
+        if p.syn and p.ack_flag:
+            sock.sendto(Packet(ack_flag=True).to_bytes(), dest)   # reenvia o 3o ACK do handshake
+            continue
+        if p.fin:                          # FIN não é ACK de dados
             continue
         if p.nack:                         # NACK(faltante) -> reenvia só aquele
             miss = _resolve_abs(p.ack, base, nxt)
@@ -239,10 +280,10 @@ def run_sender(host, port, filepath, mode="saw", window=1, verbose=True):
 
     effective_window = _handshake(sock, dest, window, verbose)
     chunks = _chunk_file(data)
+    start = time.monotonic()       # cronometra só a fase de transferência de dados
     _DISPATCH[mode](sock, dest, chunks, effective_window, stats)
+    elapsed = time.monotonic() - start    # mede só a transferência de dados, antes do encerramento
     _close(sock, dest, stats)
-
-    elapsed = time.monotonic() - start
     sock.close()
 
     throughput = (len(data) * 8 / elapsed) if elapsed > 0 else 0

@@ -17,6 +17,14 @@ from receiver import run_receiver
 from sender import run_sender
 
 
+def window_size(value):
+    """Janela é negociada no campo Length de 8 bits: faixa válida 1..255."""
+    ivalue = int(value)
+    if not 1 <= ivalue <= 255:
+        raise argparse.ArgumentTypeError("--window deve estar entre 1 e 255")
+    return ivalue
+
+
 def main():
     parser = argparse.ArgumentParser(description="SRTP sobre UDP (saw | gbn | sr)")
     parser.add_argument("--listen", action="store_true",
@@ -28,8 +36,8 @@ def main():
                         help="arquivo de saída (modo receiver)")
     parser.add_argument("--mode", default="saw", choices=["saw", "gbn", "sr"],
                         help="modo do protocolo: saw | gbn | sr")
-    parser.add_argument("--window", type=int, default=1,
-                        help="tamanho de janela proposto no handshake")
+    parser.add_argument("--window", type=window_size, default=1,
+                        help="tamanho de janela proposto no handshake (1..255)")
     args = parser.parse_args()
 
     if args.listen:

@@ -6,7 +6,7 @@ O mesmo binário suporta os três modos via `--mode {saw,gbn,sr}`.
 
 ## Requisitos
 
-- Python 3 (testado com 3.14). Sem dependências externas — usa apenas a
+- Python 3.11+. Sem dependências externas — usa apenas a
   biblioteca padrão (`socket`, `struct`, `zlib`).
 
 ## Como executar
@@ -102,4 +102,44 @@ No Linux/macOS:
 
 ```bash
 sha256sum arquivo.bin recebido.bin   # os dois hashes devem ser iguais
+```
+
+## Empacotamento da entrega
+
+O zip da entrega contem **apenas** o necessario:
+
+- Fontes `.py` (`srtp.py`, `packet.py`, `sender.py`, `receiver.py`, `corrupt.py`,
+  `bench.py`, os `test_*.py`).
+- `README.md` e o relatorio exportado em `docs/relatorio.pdf`.
+- `capturas/` com todos os `.pcapng`.
+
+E **exclui**: binarios/dados de teste (`*.bin`, `received.bin`, `teste.bin`,
+`recebido.bin`), `__pycache__/`, o PDF do enunciado (`T2_20261.pdf`), os rascunhos
+em markdown (`docs/runbook_capturas.md`, `docs/relatorio.md`) e a pasta
+`docs/superpowers/` (notas internas de processo — nao fazem parte da entrega).
+
+> Antes de zipar, exporte `docs/relatorio.md` para PDF como `docs/relatorio.pdf`
+> (no maximo 5 paginas).
+
+Para montar o zip apenas com o conteudo exigido (PowerShell, na raiz do repo).
+Os arquivos sao copiados para uma pasta temporaria antes de zipar, garantindo que
+`docs/superpowers/` e os rascunhos em markdown nao vazem para a entrega:
+
+```powershell
+$fontes = @(
+  'srtp.py','packet.py','sender.py','receiver.py','corrupt.py','bench.py',
+  'test_packet.py','test_e2e.py','test_loss.py','test_modes.py',
+  'README.md'
+)
+$stage = Join-Path $env:TEMP 'entrega_srtp'
+Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $stage | Out-Null
+
+Copy-Item $fontes -Destination $stage
+New-Item -ItemType Directory -Path (Join-Path $stage 'docs') | Out-Null
+Copy-Item 'docs/relatorio.pdf' -Destination (Join-Path $stage 'docs')
+Copy-Item 'capturas' -Destination $stage -Recurse -Filter '*.pcapng'
+
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath entrega_srtp.zip -Force
+Remove-Item $stage -Recurse -Force
 ```

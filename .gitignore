@@ -1,3 +1,8 @@
 __pycache__/
+.pytest_cache/
 *.pyc
 received.bin
+recebido.bin
+*.bin
+T2_20261.pdf
+# docs/superpowers/ permanece versionado, mas e excluido do zip da entrega

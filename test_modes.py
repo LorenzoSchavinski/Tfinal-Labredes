@@ -38,7 +38,7 @@ class ImpairProxy(threading.Thread):
         self.drop_data_every = drop_data_every
         self.drop_ack_every = drop_ack_every
         self.reorder_data_every = reorder_data_every
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", listen_port))
         self.sock.settimeout(0.2)
@@ -47,7 +47,7 @@ class ImpairProxy(threading.Thread):
         data_count = 0
         ack_count = 0
         pending = None  # pacote de dados segurado para reordenar
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 pkt, src = self.sock.recvfrom(2048)
             except socket.timeout:
@@ -74,7 +74,7 @@ class ImpairProxy(threading.Thread):
                     pending = None
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
         self.join(timeout=1)
         self.sock.close()
 
@@ -88,7 +88,7 @@ class TestModes(unittest.TestCase):
             f.write(bytes(i % 256 for i in range(size)))
 
         proxy_port = base
-        receiver_port = base + 50
+        receiver_port = base - 1  # receiver_port = proxy_port - 1 so the receiver's P+1 control lands on the proxy
 
         proxy = ImpairProxy(proxy_port, receiver_port, **impair)
         proxy.start()

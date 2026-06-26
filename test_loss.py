@@ -78,7 +78,7 @@ class TestUnderLoss(unittest.TestCase):
             f.write(bytes(i % 256 for i in range(size)))
 
         proxy_port = base          # sender envia aqui (X); escuta ACKs em X+1
-        receiver_port = base + 50  # Y
+        receiver_port = base - 1   # receiver_port = proxy_port - 1 so the receiver's P+1 control lands on the proxy
 
         proxy = LossyProxy(proxy_port, receiver_port, drop_data_every, drop_ack_every)
         proxy.start()

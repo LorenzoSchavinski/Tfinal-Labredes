@@ -15,6 +15,7 @@ com o clumsy + Wireshark (.pcapng). Este harness serve para sanity-check local e
 para entender as tendências antes do lab.
 """
 import argparse
+import hashlib
 import os
 import socket
 import tempfile
@@ -25,20 +26,53 @@ from receiver import run_receiver
 from sender import run_sender, TIMEOUT
 from packet import HEADER_SIZE, MAX_PAYLOAD
 
-PKT_BITS = (HEADER_SIZE + MAX_PAYLOAD) * 8   # bits por pacote cheio (no fio)
+# ----------------------------------------------------------------------------
+# MODELO CANÔNICO DE VAZÃO (deve bater exatamente com o relatório)
+#
+# Pacote no fio: header 9 bytes + payload. Pacote de dados cheio => payload 255 B.
+#   L_wire = (9 + 255) * 8 = 2112 bits   (tamanho no fio)
+#   L_pay  =       255  * 8 = 2040 bits   (payload útil)
+# R       = taxa do enlace/canal em bits/s (parâmetro --rate; padrão LAN 1e9).
+# t_trans = L_wire / R                     (tempo de transmissão de 1 pacote)
+# RTT     = round-trip base + latência adicionada do cenário.
+#
+# Stop-and-wait (saw):
+#   ciclo  = RTT + t_trans
+#   U_sw   = t_trans / (RTT + t_trans)
+#   G_sw   = L_pay / (RTT + t_trans)                       (goodput, bits/s úteis)
+# Janela (gbn/sr), janela N:
+#   U_win  = min(1, N * t_trans / (RTT + t_trans))
+#   G_win  = min( R * L_pay / L_wire , N * L_pay / (RTT + t_trans) )
+# Sob perda p (aproximação stop-and-wait): E[transmissões/pacote] = 1/(1-p), logo
+#   G_sw_loss ~= G_sw * (1 - p)            (rotulado como APROXIMAÇÃO)
+#
+# Número primário = goodput de payload (G_*, bits úteis/s); também imprimimos a
+# utilização do enlace U em %. Medido e teórico são a MESMA grandeza: bits de
+# payload por segundo (goodput), não throughput no fio.
+# ----------------------------------------------------------------------------
+L_WIRE = (HEADER_SIZE + MAX_PAYLOAD) * 8   # 2112 bits: pacote de dados cheio no fio
+L_PAY = MAX_PAYLOAD * 8                     # 2040 bits: payload útil por pacote
 
 
-def throughput_teorico(rtt, window, link_bps=None):
-    """Throughput teórico (bits/s) de ARQ com janela (Kurose & Ross, 3.4).
+def goodput_teorico(mode, window, rtt, rate, loss_pct=0.0):
+    """Goodput teórico (bits de payload/s) e utilização U do enlace.
 
-    Stop-and-wait é o caso window=1. Sem perda:
-        U = window * (L/R) / (RTT + L/R), limitado por R (link_bps).
-    Aqui L/R (tempo de transmissão) é desprezível em localhost; usamos o modelo
-    dominado por RTT: vazão ~= window * L / RTT (bits/s), onde L é o pacote no fio.
+    Usa exatamente as fórmulas do MODELO CANÔNICO acima. Retorna (G, U) onde G
+    está em bits úteis/s e U em fração [0,1]. Para saw aplica a aproximação de
+    perda G_sw * (1 - p); gbn/sr ignoram p (não modelado aqui).
     """
-    if rtt <= 0:
-        return float("inf")
-    return window * PKT_BITS / rtt
+    t_trans = L_WIRE / rate
+    cycle = rtt + t_trans
+    if mode == "saw":
+        g = L_PAY / cycle
+        u = t_trans / cycle
+        if loss_pct > 0:
+            p = loss_pct / 100.0
+            g *= (1 - p)          # aproximação: E[tx/pacote] = 1/(1-p)
+        return g, u
+    g = min(rate * L_PAY / L_WIRE, window * L_PAY / cycle)
+    u = min(1.0, window * t_trans / cycle)
+    return g, u
 
 
 class DelayLossProxy(threading.Thread):
@@ -52,7 +86,7 @@ class DelayLossProxy(threading.Thread):
         self.latency = latency
         self.loss_pct = loss_pct
         self.reorder_pct = reorder_pct
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", listen_port))
         self.sock.settimeout(0.005)
@@ -73,7 +107,7 @@ class DelayLossProxy(threading.Thread):
 
     def run(self):
         pending = None
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             self._flush_due()
             try:
                 pkt, src = self.sock.recvfrom(2048)
@@ -97,41 +131,54 @@ class DelayLossProxy(threading.Thread):
                 pending = None
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
         self.join(timeout=1)
         self.sock.close()
 
 
-def run_once(mode, window, size, latency, loss, reorder, base=8200):
+def run_once(mode, window, size, latency, loss, reorder, rate, base_rtt, base=8200):
     d = tempfile.mkdtemp()
     infile = os.path.join(d, "in.bin")
     outfile = os.path.join(d, "out.bin")
     with open(infile, "wb") as f:
         f.write(bytes(i % 256 for i in range(size)))
 
-    proxy = DelayLossProxy(base, base + 50, latency, loss, reorder)
+    # receiver_port = proxy_port - 1 so the receiver's P+1 control lands on the proxy
+    proxy = DelayLossProxy(base, base - 1, latency, loss, reorder)
     proxy.start()
 
     rx = threading.Thread(
         target=run_receiver,
-        kwargs={"port": base + 50, "outpath": outfile, "mode": mode,
+        kwargs={"port": base - 1, "outpath": outfile, "mode": mode,
                 "window": window, "verbose": False},
         daemon=True)
     rx.start()
 
-    start = time.monotonic()
     stats = run_sender("127.0.0.1", base, infile, mode=mode, window=window,
                        verbose=False)
     rx.join(timeout=60)
-    elapsed = time.monotonic() - start
     proxy.stop()
 
     rt = stats["rt"]
-    ok = (os.path.getsize(infile) == os.path.getsize(outfile))
-    meas = (size * 8 / elapsed) if elapsed > 0 else 0
-    rtt = 2 * latency
-    teo = throughput_teorico(rtt, window) if latency > 0 else float("inf")
-    return meas, rt, ok, teo
+    # elapsed da fase de dados do sender (sem handshake/close), p/ casar com o teórico.
+    data_elapsed = stats["elapsed"]
+    # interoperabilidade = conteúdo byte-a-byte idêntico (hash), não só tamanho:
+    # uma saída corrompida de mesmo tamanho deve contar como falha.
+    if os.path.exists(outfile):
+        with open(infile, "rb") as f:
+            in_hash = hashlib.sha256(f.read()).hexdigest()
+        with open(outfile, "rb") as f:
+            out_hash = hashlib.sha256(f.read()).hexdigest()
+        ok = (in_hash == out_hash)
+    else:
+        ok = False
+    # goodput medido: bits de PAYLOAD (conteúdo do arquivo) / s — mesma grandeza
+    # que o teórico (não inclui os 9 B de header por pacote).
+    meas = (size * 8 / data_elapsed) if data_elapsed > 0 else 0
+    # RTT do cenário = round-trip base + latência adicionada nos dois sentidos.
+    rtt = base_rtt + 2 * latency
+    teo, util = goodput_teorico(mode, window, rtt, rate, loss)
+    return meas, rt, ok, teo, util
 
 
 def main():
@@ -142,19 +189,25 @@ def main():
     ap.add_argument("--latency", type=float, default=0.0, help="latência por sentido (s)")
     ap.add_argument("--loss", type=float, default=0, help="perda (porcentagem)")
     ap.add_argument("--reorder", type=float, default=0, help="reordenacao (porcentagem)")
+    ap.add_argument("--rate", type=float, default=1e9,
+                    help="taxa do enlace R em bits/s (SUPOSIÇÃO; padrão 1e9 = 1 Gb/s LAN)")
+    ap.add_argument("--base-rtt", type=float, default=2e-4,
+                    help="RTT base do enlace em s p/ cenário L0 (SUPOSIÇÃO; padrão 0.2 ms localhost)")
     args = ap.parse_args()
 
-    print(f"{'modo':5} {'jan':>4} {'medido(kbps)':>13} {'teorico(kbps)':>14} "
-          f"{'retr':>5} {'ok':>3}")
+    # Ambos medido e teórico são GOODPUT: bits de payload úteis/s (não no fio).
+    print(f"{'modo':5} {'jan':>4} {'lat+(s)':>8} {'perda%':>6} {'reord%':>6} "
+          f"{'medido(kbps)':>13} {'teorico(kbps)':>14} {'U%':>5} {'retr':>5} {'ok':>3}")
     combos = ([(args.mode, args.window)] if args.mode
               else [("saw", 1), ("gbn", 4), ("gbn", 16), ("sr", 4), ("sr", 16)])
     for k, (mode, window) in enumerate(combos):
-        meas, rt, ok, teo = run_once(mode, window, args.size,
-                                     args.latency, args.loss, args.reorder,
-                                     base=8200 + k * 100)
-        teo_s = "inf" if teo == float("inf") else f"{teo / 1000:13.1f}"
-        print(f"{mode:5} {window:>4} {meas / 1000:13.1f} {teo_s:>14} "
-              f"{rt:>5} {'sim' if ok else 'NAO':>3}")
+        meas, rt, ok, teo, util = run_once(mode, window, args.size,
+                                           args.latency, args.loss, args.reorder,
+                                           args.rate, args.base_rtt,
+                                           base=8200 + k * 100)
+        print(f"{mode:5} {window:>4} {args.latency:8.3f} {args.loss:6.1f} "
+              f"{args.reorder:6.1f} {meas / 1000:13.1f} {teo / 1000:14.1f} "
+              f"{util * 100:5.1f} {rt:>5} {'sim' if ok else 'NAO':>3}")
 
 
 if __name__ == "__main__":
