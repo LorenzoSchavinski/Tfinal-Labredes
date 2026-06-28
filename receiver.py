@@ -20,7 +20,10 @@ def _handshake(sock, window, verbose=True):
     """Espera o SYN, responde SYN+ACK. Retorna (sender_addr, synack_bytes, janela)."""
     sender_addr = None
     while sender_addr is None:
-        data, addr = sock.recvfrom(2048)  # bloqueia aguardando o primeiro SYN (comportamento de listener)
+        try:
+            data, addr = sock.recvfrom(2048)  # bloqueia aguardando o primeiro SYN (comportamento de listener)
+        except ConnectionResetError:
+            continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
         try:
             syn = Packet.from_bytes(data)
         except (struct.error, ValueError):
@@ -45,6 +48,8 @@ def _recv_saw(sock, syn_addr, synack, control_addr, window, state):
     while True:
         try:
             data, src = sock.recvfrom(2048)
+        except ConnectionResetError:
+            continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
         except socket.timeout:
             print("[receiver] timeout de inatividade — encerrando")
             return
@@ -94,6 +99,8 @@ def _recv_gbn(sock, syn_addr, synack, control_addr, window, state):
     while True:
         try:
             data, src = sock.recvfrom(2048)
+        except ConnectionResetError:
+            continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
         except socket.timeout:
             print("[receiver] timeout de inatividade — encerrando")
             return
@@ -164,6 +171,8 @@ def _recv_sr(sock, syn_addr, synack, control_addr, window, state):
     while True:
         try:
             data, src = sock.recvfrom(2048)
+        except ConnectionResetError:
+            continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
         except socket.timeout:
             print("[receiver] timeout de inatividade — encerrando")
             return
@@ -223,6 +232,8 @@ def _linger_close(sock, control_addr):
     for _ in range(20):
         try:
             data, src = sock.recvfrom(2048)
+        except ConnectionResetError:
+            continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
         except socket.timeout:
             quiet += 1
             if quiet >= 3:

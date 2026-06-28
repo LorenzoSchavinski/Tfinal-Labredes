@@ -59,6 +59,8 @@ def _handshake(sock, dest, window, verbose=True):
     while True:
         try:
             data, _ = sock.recvfrom(2048)
+        except ConnectionResetError:
+            continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
         except socket.timeout:
             sock.sendto(raw, dest)
             continue
@@ -85,6 +87,8 @@ def _close(sock, dest, stats):
     while retries < 10:
         try:
             data, _ = sock.recvfrom(2048)
+        except ConnectionResetError:
+            continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
         except socket.timeout:
             retries += 1
             stats["rt"] += 1
@@ -110,6 +114,8 @@ def _send_saw(sock, dest, chunks, window, stats):
         while True:
             try:
                 data, _ = sock.recvfrom(2048)
+            except ConnectionResetError:
+                continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
             except socket.timeout:
                 stats["rt"] += 1
                 sock.sendto(raw, dest)
@@ -166,6 +172,8 @@ def _send_gbn(sock, dest, chunks, window, stats):
         sock.settimeout(remaining)
         try:
             data, _ = sock.recvfrom(2048)
+        except ConnectionResetError:
+            continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
         except socket.timeout:
             resend_window()
             timer = time.monotonic() + TIMEOUT
@@ -227,6 +235,8 @@ def _send_sr(sock, dest, chunks, window, stats):
         sock.settimeout(max(remaining, 0.001))
         try:
             data, _ = sock.recvfrom(2048)
+        except ConnectionResetError:
+            continue  # Windows: ICMP port-unreachable de um envio anterior; ignora e re-tenta
         except socket.timeout:
             continue
 
